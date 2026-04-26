@@ -26,15 +26,15 @@ import sys
 import os
 
 # Add paths for local library imports
-sys.path.append(os.path.join(os.getcwd(), "DEQ_kernel"))
 sys.path.append(os.path.join(os.getcwd(), "architecture_kernels"))
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "learning_rules"))
 
 try:
-    from deq_solver import DEQModule, jacobian_spectral_norm
+    from DEQ_kernels import DEQModule, jacobian_spectral_norm
 except ImportError:
-    # Fallback if pathing is tricky in the current environment
-    sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/../DEQ_kernel")
-    from deq_solver import DEQModule, jacobian_spectral_norm
+    # Fallback: add the DEQ_kernels parent to path and retry
+    sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "learning_rules"))
+    from DEQ_kernels import DEQModule, jacobian_spectral_norm
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1.  FAST APPROXIMATIONS (PWL for Exp and Log)
