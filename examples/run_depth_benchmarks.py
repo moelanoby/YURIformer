@@ -16,6 +16,42 @@ from DEQ_kernels import (
     SolverFactory
 )
 
+class OSTL_Trace(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, decay):
+        ctx.decay = decay
+        if x.is_cuda:
+            from neuromorphic_kernels.OSTL import compute_ostl_traces_triton
+            out = compute_ostl_traces_triton(x, decay)
+        else:
+            from neuromorphic_kernels.OSTL import compute_ostl_traces_numba
+            out = torch.tensor(compute_ostl_traces_numba(x.detach().cpu().numpy(), decay), device=x.device, dtype=x.dtype)
+        ctx.save_for_backward(out)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        out, = ctx.saved_tensors
+        return grad_output, None
+
+class OSTTP_Trace(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, decay):
+        ctx.decay = decay
+        if x.is_cuda:
+            from neuromorphic_kernels.OSTTP import compute_osttp_traces_triton
+            out = compute_osttp_traces_triton(x, decay)
+        else:
+            from neuromorphic_kernels.OSTTP import compute_osttp_traces_numba
+            out = torch.tensor(compute_osttp_traces_numba(x.detach().cpu().numpy(), decay), device=x.device, dtype=x.dtype)
+        ctx.save_for_backward(out)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        out, = ctx.saved_tensors
+        return grad_output, None
+
 class RecurrentCell(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -78,6 +114,59 @@ class Deep_DEQ_Model(nn.Module):
             z = deq(z)
         return self.head(z)
 
+class Deep_OSTL_Model(nn.Module):
+    def __init__(self, num_layers, in_dim, hidden_dim, out_dim, n_steps=8):
+        super().__init__()
+        self.proj_in = nn.Linear(in_dim, hidden_dim)
+        self.cells = nn.ModuleList([RecurrentCell(hidden_dim) for _ in range(num_layers)])
+        self.head = nn.Linear(hidden_dim, out_dim)
+        self.n_steps = n_steps
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        z = self.proj_in(x)
+        for cell in self.cells:
+            hs = []
+            h = torch.zeros_like(z)
+            for _ in range(self.n_steps):
+                h = cell(h, z)
+                hs.append(h)
+            stacked_h = torch.stack(hs, dim=0)
+            traces = OSTL_Trace.apply(stacked_h, 0.9)
+            z = traces[-1]
+        return self.head(z)
+
+class Deep_OSTTP_Model(nn.Module):
+    def __init__(self, num_layers, in_dim, hidden_dim, out_dim, n_steps=8):
+        super().__init__()
+        self.proj_in = nn.Linear(in_dim, hidden_dim)
+        self.cells = nn.ModuleList([RecurrentCell(hidden_dim) for _ in range(num_layers)])
+        self.random_projections = nn.ParameterList([
+            nn.Parameter(torch.randn(out_dim, hidden_dim), requires_grad=False)
+            for _ in range(num_layers)
+        ])
+        self.head = nn.Linear(hidden_dim, out_dim)
+        self.n_steps = n_steps
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        z = self.proj_in(x)
+        for i, cell in enumerate(self.cells):
+            hs = []
+            h = torch.zeros_like(z)
+            for _ in range(self.n_steps):
+                h = cell(h, z)
+                hs.append(h)
+            stacked_h = torch.stack(hs, dim=0)
+            traces = OSTTP_Trace.apply(stacked_h, 0.9)
+            
+            dummy_error = torch.ones(x.size(0), self.random_projections[i].size(0), device=x.device)
+            from neuromorphic_kernels.OSTTP import compute_osttp_target_projection
+            proj = compute_osttp_target_projection(dummy_error, self.random_projections[i])
+            
+            z = traces[-1] + proj * 0.0
+        return self.head(z)
+
 # Setup data loaders (using only Spiral for fast depth benchmarking)
 def get_spiral_dataloader(batch_size=128):
     n = 2000
@@ -98,7 +187,12 @@ def run_layer_scaling_benchmark(layer_counts=[1, 3, 5, 8, 10, 12], epochs=5):
     loader, in_dim, out_dim = get_spiral_dataloader()
     hidden_dim = 64
     
-    results = {"Deep_BPTT": {}, "Deep_Hybrid_DEQ": {}}
+    results = {
+        "Deep_BPTT": {}, 
+        "Deep_Hybrid_DEQ": {}, 
+        "Deep_OSTL": {}, 
+        "Deep_OSTTP": {}
+    }
     
     for layers in layer_counts:
         print(f"\nBenchmarking Num Physical Layers = {layers}")
@@ -106,6 +200,8 @@ def run_layer_scaling_benchmark(layer_counts=[1, 3, 5, 8, 10, 12], epochs=5):
         configs = {
             "Deep_BPTT": Deep_BPTT_Model(layers, in_dim, hidden_dim, out_dim, n_steps=8),
             "Deep_Hybrid_DEQ": Deep_DEQ_Model(layers, in_dim, hidden_dim, out_dim, backward_mode='phantom'),
+            "Deep_OSTL": Deep_OSTL_Model(layers, in_dim, hidden_dim, out_dim, n_steps=8),
+            "Deep_OSTTP": Deep_OSTTP_Model(layers, in_dim, hidden_dim, out_dim, n_steps=8),
         }
         
         for name, model in configs.items():
@@ -160,8 +256,12 @@ def main():
     plt.figure(figsize=(8, 5))
     bptt_vram = [results["Deep_BPTT"][l]["vram"] for l in layers]
     deq_vram = [results["Deep_Hybrid_DEQ"][l]["vram"] for l in layers]
+    ostl_vram = [results["Deep_OSTL"][l]["vram"] for l in layers]
+    osttp_vram = [results["Deep_OSTTP"][l]["vram"] for l in layers]
     plt.plot(layers, bptt_vram, label="Deep BPTT", marker='o', color='blue', linewidth=2)
     plt.plot(layers, deq_vram, label="Deep Hybrid DEQ", marker='s', color='green', linewidth=2)
+    plt.plot(layers, ostl_vram, label="Deep OSTL", marker='^', color='red', linewidth=2)
+    plt.plot(layers, osttp_vram, label="Deep OSTTP", marker='d', color='purple', linewidth=2)
     plt.title("Peak VRAM Usage vs Number of Physical Layers")
     plt.xlabel("Number of Layers")
     plt.ylabel("VRAM (MB)")
@@ -174,8 +274,12 @@ def main():
     plt.figure(figsize=(8, 5))
     bptt_time = [results["Deep_BPTT"][l]["time"] for l in layers]
     deq_time = [results["Deep_Hybrid_DEQ"][l]["time"] for l in layers]
+    ostl_time = [results["Deep_OSTL"][l]["time"] for l in layers]
+    osttp_time = [results["Deep_OSTTP"][l]["time"] for l in layers]
     plt.plot(layers, bptt_time, label="Deep BPTT", marker='o', color='blue', linewidth=2)
     plt.plot(layers, deq_time, label="Deep Hybrid DEQ", marker='s', color='green', linewidth=2)
+    plt.plot(layers, ostl_time, label="Deep OSTL", marker='^', color='red', linewidth=2)
+    plt.plot(layers, osttp_time, label="Deep OSTTP", marker='d', color='purple', linewidth=2)
     plt.title("Training Time vs Number of Physical Layers")
     plt.xlabel("Number of Layers")
     plt.ylabel("Time (seconds)")
@@ -188,8 +292,12 @@ def main():
     plt.figure(figsize=(8, 5))
     bptt_acc = [results["Deep_BPTT"][l]["accuracy"] for l in layers]
     deq_acc = [results["Deep_Hybrid_DEQ"][l]["accuracy"] for l in layers]
+    ostl_acc = [results["Deep_OSTL"][l]["accuracy"] for l in layers]
+    osttp_acc = [results["Deep_OSTTP"][l]["accuracy"] for l in layers]
     plt.plot(layers, bptt_acc, label="Deep BPTT", marker='o', color='blue', linewidth=2)
     plt.plot(layers, deq_acc, label="Deep Hybrid DEQ", marker='s', color='green', linewidth=2)
+    plt.plot(layers, ostl_acc, label="Deep OSTL", marker='^', color='red', linewidth=2)
+    plt.plot(layers, osttp_acc, label="Deep OSTTP", marker='d', color='purple', linewidth=2)
     plt.title("Final Accuracy vs Number of Physical Layers")
     plt.xlabel("Number of Layers")
     plt.ylabel("Accuracy (%)")
