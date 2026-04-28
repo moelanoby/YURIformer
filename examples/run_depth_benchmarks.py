@@ -1,17 +1,24 @@
+
 import sys, os, time, math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import torchvision
+import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
 
+# Make DEQ_kernels importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "learning_rules"))
+
 from DEQ_kernels import (
-    DEQModule, HybridConfig, SolverFactory
+    DEQModule,
+    PJWRConfig, AndersonConfig, BroydenConfig, HybridConfig,
+    SolverFactory
 )
 
 # =============================================================================
-# LOCAL LEARNING FUNCTIONS (No backprop through cell internals)
+# LOCAL LEARNING FUNCTIONS (Fixed: online traces, no storage of all timesteps)
 # =============================================================================
 
 class OSTL_Function(torch.autograd.Function):
@@ -25,28 +32,17 @@ class OSTL_Function(torch.autograd.Function):
         
         with torch.no_grad():
             h = torch.zeros_like(z)
-            hs = []
+            h_trace = torch.zeros_like(z)
+            
             for _ in range(n_steps):
                 h = cell(h, z)
-                hs.append(h)
-            stacked_h = torch.stack(hs, dim=0)
-            
-            if z.is_cuda:
-                from neuromorphic_kernels.OSTL import compute_ostl_traces_triton
-                traces = compute_ostl_traces_triton(stacked_h, decay)
-            else:
-                from neuromorphic_kernels.OSTL import compute_ostl_traces_numba
-                traces = torch.tensor(
-                    compute_ostl_traces_numba(stacked_h.detach().cpu().numpy(), decay),
-                    device=device, dtype=dtype
-                )
+                h_trace = decay * h_trace + h
             
             sum_decay = (1 - decay**n_steps) / (1 - decay)
             z_trace = z * sum_decay
-            h_trace = traces[-1]
             
         ctx.save_for_backward(z, h_trace, z_trace)
-        return hs[-1]
+        return h
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -54,7 +50,6 @@ class OSTL_Function(torch.autograd.Function):
         cell = ctx.cell
         
         with torch.no_grad():
-            # Manual local weight updates: Delta W = error * trace
             if cell.Wx.weight.grad is None:
                 cell.Wx.weight.grad = torch.zeros_like(cell.Wx.weight)
             cell.Wx.weight.grad.add_(grad_output.t() @ z_trace)
@@ -67,8 +62,7 @@ class OSTL_Function(torch.autograd.Function):
                 if cell.Wz.bias.grad is None:
                     cell.Wz.bias.grad = torch.zeros_like(cell.Wz.bias)
                 cell.Wz.bias.grad.add_(grad_output.sum(0))
-        
-        # "Bypass" error signal to previous layer (not backprop through weights)
+
         return grad_output, None, None, None
 
 
@@ -84,28 +78,17 @@ class OSTTP_Function(torch.autograd.Function):
         
         with torch.no_grad():
             h = torch.zeros_like(z)
-            hs = []
+            h_trace = torch.zeros_like(z)
+            
             for _ in range(n_steps):
                 h = cell(h, z)
-                hs.append(h)
-            stacked_h = torch.stack(hs, dim=0)
-            
-            if z.is_cuda:
-                from neuromorphic_kernels.OSTTP import compute_osttp_traces_triton
-                traces = compute_osttp_traces_triton(stacked_h, decay)
-            else:
-                from neuromorphic_kernels.OSTTP import compute_osttp_traces_numba
-                traces = torch.tensor(
-                    compute_osttp_traces_numba(stacked_h.detach().cpu().numpy(), decay),
-                    device=device, dtype=dtype
-                )
+                h_trace = decay * h_trace + h
                 
             sum_decay = (1 - decay**n_steps) / (1 - decay)
             z_trace = z * sum_decay
-            h_trace = traces[-1]
             
         ctx.save_for_backward(z, h_trace, z_trace)
-        return hs[-1]
+        return h
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -113,7 +96,6 @@ class OSTTP_Function(torch.autograd.Function):
         cell = ctx.cell
         random_proj = ctx.random_proj
         
-        # Random Target Projection: project global error locally
         projected_error = grad_output @ random_proj
         
         with torch.no_grad():
@@ -125,13 +107,11 @@ class OSTTP_Function(torch.autograd.Function):
                 cell.Wz.weight.grad = torch.zeros_like(cell.Wz.weight)
             cell.Wz.weight.grad.add_(projected_error.t() @ h_trace)
             
-            # FIXED: OSTTP now also updates bias
             if cell.Wz.bias is not None:
                 if cell.Wz.bias.grad is None:
                     cell.Wz.bias.grad = torch.zeros_like(cell.Wz.bias)
                 cell.Wz.bias.grad.add_(projected_error.sum(0))
-        
-        # Bypass error signal
+            
         return grad_output, None, None, None, None
 
 
@@ -140,7 +120,7 @@ class OSTTP_Function(torch.autograd.Function):
 # =============================================================================
 
 class RecurrentCell(nn.Module):
-    """Simplified cell: no LayerNorm so ALL parameters get local gradients."""
+    """Simplified cell for local learning (no LayerNorm)."""
     def __init__(self, dim):
         super().__init__()
         self.Wz = nn.Linear(dim, dim)
@@ -229,28 +209,34 @@ class Deep_OSTTP_Model(nn.Module):
 
 
 # =============================================================================
+# CIFAR-10 DATA
+# =============================================================================
+
+def get_cifar10_dataloader(batch_size=128):
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    ])
+    trainset = torchvision.datasets.CIFAR10(
+        root='./data', train=True, download=True, transform=transform
+    )
+    trainloader = torch.utils.data.DataLoader(
+        trainset, batch_size=batch_size, shuffle=True, num_workers=2
+    )
+    # CIFAR-10: 32x32x3 = 3072 input features, 10 classes
+    return trainloader, 3072, 10
+
+
+# =============================================================================
 # BENCHMARK
 # =============================================================================
 
-def get_spiral_dataloader(batch_size=128):
-    n = 2000
-    t = torch.linspace(0, 3 * math.pi, n // 2)
-    r = t / (3 * math.pi)
-    X = torch.cat([
-        torch.stack([r * torch.cos(t), r * torch.sin(t)], 1),
-        torch.stack([r * torch.cos(t + math.pi), r * torch.sin(t + math.pi)], 1),
-    ]) + 0.25 * torch.randn(n, 2)
-    y = torch.cat([torch.zeros(n // 2), torch.ones(n // 2)]).long()
-    dataset = torch.utils.data.TensorDataset(X, y)
-    return torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True), 2, 2
-
-
 def run_benchmark(layer_counts=[1, 3, 5, 8, 10, 12], epochs=5):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\n--- Layer Scaling Benchmark ({device}) ---")
+    print(f"\n--- CIFAR-10 Layer Scaling Benchmark ({device}) ---")
     
-    loader, in_dim, out_dim = get_spiral_dataloader()
-    hidden_dim = 64
+    loader, in_dim, out_dim = get_cifar10_dataloader(batch_size=128)
+    hidden_dim = 256
     
     results = {name: {} for name in ["Deep_BPTT", "Deep_Hybrid_DEQ", "Deep_OSTL", "Deep_OSTTP"]}
     
@@ -265,7 +251,7 @@ def run_benchmark(layer_counts=[1, 3, 5, 8, 10, 12], epochs=5):
         }
         
         for name, model in configs.items():
-            print(f"  {name}...", end=" ")
+            print(f"  {name}...", end=" ", flush=True)
             model.to(device)
             optimizer = optim.Adam(model.parameters(), lr=1e-3)
             
@@ -287,12 +273,14 @@ def run_benchmark(layer_counts=[1, 3, 5, 8, 10, 12], epochs=5):
                     correct += (logits.argmax(dim=1) == y).sum().item()
                     total += y.size(0)
                 acc = correct / total * 100
+                if ep == epochs - 1:
+                    final_acc = acc
             
             peak_vram = torch.cuda.max_memory_allocated() / (1024**2) if torch.cuda.is_available() else 0
             elapsed = time.time() - start
             
-            results[name][layers] = {"time": elapsed, "vram": peak_vram, "accuracy": acc}
-            print(f"Time={elapsed:.2f}s VRAM={peak_vram:.1f}MB Acc={acc:.1f}%")
+            results[name][layers] = {"time": elapsed, "vram": peak_vram, "accuracy": final_acc}
+            print(f"Time={elapsed:.1f}s VRAM={peak_vram:.0f}MB Acc={final_acc:.1f}%")
             
     return results, layer_counts
 
@@ -301,9 +289,9 @@ def plot(results, layers):
     os.makedirs("benchmark_plots", exist_ok=True)
     
     for metric, ylabel, fname in [
-        ("vram", "VRAM (MB)", "layer_scaling_vram.png"),
-        ("time", "Time (seconds)", "layer_scaling_time.png"),
-        ("accuracy", "Accuracy (%)", "layer_scaling_accuracy.png")
+        ("vram", "VRAM (MB)", "layer_scaling_vram_cifar10.png"),
+        ("time", "Time (seconds)", "layer_scaling_time_cifar10.png"),
+        ("accuracy", "Accuracy (%)", "layer_scaling_accuracy_cifar10.png")
     ]:
         plt.figure(figsize=(8, 5))
         colors = {"Deep_BPTT": "blue", "Deep_Hybrid_DEQ": "green", 
@@ -314,17 +302,21 @@ def plot(results, layers):
         for name in colors:
             vals = [results[name][l][metric] for l in layers]
             plt.plot(layers, vals, label=name.replace("_", " "), 
-                     marker=markers[name], color=colors[name], linewidth=2)
+                     marker=markers[name], color=colors[name], linewidth=2, markersize=7)
         
-        plt.title(f"{ylabel.split(' ')[0]} vs Number of Physical Layers")
+        plt.title(f"{ylabel.split(' ')[0]} vs Number of Physical Layers (CIFAR-10)")
         plt.xlabel("Number of Layers")
         plt.ylabel(ylabel)
         plt.legend()
         plt.grid(True)
+        plt.tight_layout()
         plt.savefig(f"benchmark_plots/{fname}")
         plt.close()
     
     print("\nPlots saved to benchmark_plots/")
+    print("- layer_scaling_vram_cifar10.png")
+    print("- layer_scaling_time_cifar10.png")
+    print("- layer_scaling_accuracy_cifar10.png")
 
 
 if __name__ == "__main__":
