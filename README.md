@@ -36,6 +36,11 @@ git clone https://github.com/moelanoby/YURIformer.git
 cd YURIformer
 pip install -e .
 ```
+or
+
+```bash
+pip install yuriformer
+```
 
 This will automatically install dependencies like `torch`, `triton`, and `numpy`, making all the `architecture_kernels`, `numeric_kernels`, and `learning_rules` importable from anywhere in your environment :D
 
