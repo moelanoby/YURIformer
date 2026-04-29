@@ -42,7 +42,14 @@ or
 pip install yuriformer
 ```
 
-This will automatically install dependencies like `torch`, `triton`, and `numpy`, making all the `architecture_kernels`, `numeric_kernels`, and `learning_rules` importable from anywhere in your environment :D
+This will automatically install dependencies like `torch`, `triton`, and `numpy`.
+Once installed, you can import the top-level packages directly into your projects, no matter where your script is located:
+
+```python
+import learning_rules
+import architecture_kernels
+import numeric_kernels
+```
 
 ---
 
