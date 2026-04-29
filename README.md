@@ -239,9 +239,9 @@ python examples/run_depth_benchmarks.py
 
 Plots are saved to `benchmark_plots/` after the run.
 
-![VRAM Scaling](benchmark_plots/layer_scaling_vram_cifar10_fixed.png)
-![Time Scaling](benchmark_plots/layer_scaling_time_cifar10_fixed.png)
-![Accuracy Scaling](benchmark_plots/layer_scaling_accuracy_cifar10_fixed.png)
+![VRAM Scaling](layer_scaling_vram_cifar10_fixed.png)
+![Time Scaling](layer_scaling_time_cifar10_fixed.png)
+![Accuracy Scaling](layer_scaling_accuracy_cifar10_fixed.png)
 
 *CIFAR-10 · Layer Scaling · `hidden_dim=256` · 5 epochs per configuration*
 
