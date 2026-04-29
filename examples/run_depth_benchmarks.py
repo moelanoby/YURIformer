@@ -1,4 +1,9 @@
-
+"""
+YURIformer Benchmark: CIFAR-10
+Fixed:
+  - DEQ: single shared cell, ONE equilibrium (weight-tied, standard DEQ)
+  - OSTL/OSTTP: online traces + manual training loop (no autograd.Function, no save_for_backward)
+"""
 import sys, os, time, math
 import torch
 import torch.nn as nn
@@ -8,119 +13,20 @@ import torchvision
 import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
 
-# Make DEQ_kernels importable
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "learning_rules"))
-
+# =============================================================================
+# PATH SETUP — adjust to your YURIformer repo
+# =============================================================================
+# sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "learning_rules"))
 from DEQ_kernels import (
-    DEQModule,
-    PJWRConfig, AndersonConfig, BroydenConfig, HybridConfig,
-    SolverFactory
+    DEQModule, HybridConfig, SolverFactory
 )
-
-# =============================================================================
-# LOCAL LEARNING FUNCTIONS (Fixed: online traces, no storage of all timesteps)
-# =============================================================================
-
-class OSTL_Function(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, z, cell, n_steps, decay):
-        ctx.decay = decay
-        ctx.n_steps = n_steps
-        ctx.cell = cell
-        
-        device, dtype = z.device, z.dtype
-        
-        with torch.no_grad():
-            h = torch.zeros_like(z)
-            h_trace = torch.zeros_like(z)
-            
-            for _ in range(n_steps):
-                h = cell(h, z)
-                h_trace = decay * h_trace + h
-            
-            sum_decay = (1 - decay**n_steps) / (1 - decay)
-            z_trace = z * sum_decay
-            
-        ctx.save_for_backward(z, h_trace, z_trace)
-        return h
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        z, h_trace, z_trace = ctx.saved_tensors
-        cell = ctx.cell
-        
-        with torch.no_grad():
-            if cell.Wx.weight.grad is None:
-                cell.Wx.weight.grad = torch.zeros_like(cell.Wx.weight)
-            cell.Wx.weight.grad.add_(grad_output.t() @ z_trace)
-            
-            if cell.Wz.weight.grad is None:
-                cell.Wz.weight.grad = torch.zeros_like(cell.Wz.weight)
-            cell.Wz.weight.grad.add_(grad_output.t() @ h_trace)
-            
-            if cell.Wz.bias is not None:
-                if cell.Wz.bias.grad is None:
-                    cell.Wz.bias.grad = torch.zeros_like(cell.Wz.bias)
-                cell.Wz.bias.grad.add_(grad_output.sum(0))
-
-        return grad_output, None, None, None
-
-
-class OSTTP_Function(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, z, cell, random_proj, n_steps, decay):
-        ctx.decay = decay
-        ctx.n_steps = n_steps
-        ctx.cell = cell
-        ctx.random_proj = random_proj
-        
-        device, dtype = z.device, z.dtype
-        
-        with torch.no_grad():
-            h = torch.zeros_like(z)
-            h_trace = torch.zeros_like(z)
-            
-            for _ in range(n_steps):
-                h = cell(h, z)
-                h_trace = decay * h_trace + h
-                
-            sum_decay = (1 - decay**n_steps) / (1 - decay)
-            z_trace = z * sum_decay
-            
-        ctx.save_for_backward(z, h_trace, z_trace)
-        return h
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        z, h_trace, z_trace = ctx.saved_tensors
-        cell = ctx.cell
-        random_proj = ctx.random_proj
-        
-        projected_error = grad_output @ random_proj
-        
-        with torch.no_grad():
-            if cell.Wx.weight.grad is None:
-                cell.Wx.weight.grad = torch.zeros_like(cell.Wx.weight)
-            cell.Wx.weight.grad.add_(projected_error.t() @ z_trace)
-            
-            if cell.Wz.weight.grad is None:
-                cell.Wz.weight.grad = torch.zeros_like(cell.Wz.weight)
-            cell.Wz.weight.grad.add_(projected_error.t() @ h_trace)
-            
-            if cell.Wz.bias is not None:
-                if cell.Wz.bias.grad is None:
-                    cell.Wz.bias.grad = torch.zeros_like(cell.Wz.bias)
-                cell.Wz.bias.grad.add_(projected_error.sum(0))
-            
-        return grad_output, None, None, None, None
-
 
 # =============================================================================
 # MODEL COMPONENTS
 # =============================================================================
 
 class RecurrentCell(nn.Module):
-    """Simplified cell for local learning (no LayerNorm)."""
+    """No LayerNorm — all params must be manually updatable for local learning."""
     def __init__(self, dim):
         super().__init__()
         self.Wz = nn.Linear(dim, dim)
@@ -134,6 +40,7 @@ class RecurrentCell(nn.Module):
 
 
 class Deep_BPTT_Model(nn.Module):
+    """Standard BPTT with num_layers DIFFERENT cells."""
     def __init__(self, num_layers, in_dim, hidden_dim, out_dim, n_steps=8):
         super().__init__()
         self.proj_in = nn.Linear(in_dim, hidden_dim)
@@ -153,43 +60,76 @@ class Deep_BPTT_Model(nn.Module):
 
 
 class Deep_DEQ_Model(nn.Module):
+    """
+    FIXED: Single shared cell, ONE equilibrium solve.
+    Standard weight-tied DEQ: the same cell is iterated to convergence.
+    num_layers is ignored — depth is implicit in the fixed-point solve.
+    """
     def __init__(self, num_layers, in_dim, hidden_dim, out_dim, backward_mode='phantom'):
         super().__init__()
         self.proj_in = nn.Linear(in_dim, hidden_dim)
-        self.deqs = nn.ModuleList()
-        for _ in range(num_layers):
-            cell = RecurrentCell(hidden_dim)
-            cfg = HybridConfig(max_iter=10, tol=1e-3, pjwr_iters=2, anderson_m=3)
-            solver = SolverFactory.create(cfg, cell)
-            self.deqs.append(DEQModule(cell, solver=solver, backward_mode=backward_mode))
+        # ONE shared cell for the entire depth
+        self.cell = RecurrentCell(hidden_dim)
+        cfg = HybridConfig(max_iter=10, tol=1e-3, pjwr_iters=2, anderson_m=3)
+        solver = SolverFactory.create(cfg, self.cell)
+        self.deq = DEQModule(self.cell, solver=solver, backward_mode=backward_mode)
         self.head = nn.Linear(hidden_dim, out_dim)
 
     def forward(self, x):
         x = x.view(x.size(0), -1)
         z = self.proj_in(x)
-        for deq in self.deqs:
-            z = deq(z)
+        z = self.deq(z)  # ONE equilibrium = infinite implicit depth
         return self.head(z)
 
 
 class Deep_OSTL_Model(nn.Module):
-    def __init__(self, num_layers, in_dim, hidden_dim, out_dim, n_steps=8):
+    """
+    Online local learning with eligibility traces.
+    Use local_forward() + manual_train_step() instead of loss.backward().
+    """
+    def __init__(self, num_layers, in_dim, hidden_dim, out_dim, n_steps=8, decay=0.9):
         super().__init__()
         self.proj_in = nn.Linear(in_dim, hidden_dim)
         self.cells = nn.ModuleList([RecurrentCell(hidden_dim) for _ in range(num_layers)])
         self.head = nn.Linear(hidden_dim, out_dim)
         self.n_steps = n_steps
+        self.decay = decay
 
     def forward(self, x):
         x = x.view(x.size(0), -1)
         z = self.proj_in(x)
         for cell in self.cells:
-            z = OSTL_Function.apply(z, cell, self.n_steps, 0.9)
+            h = torch.zeros_like(z)
+            for _ in range(self.n_steps):
+                h = cell(h, z)
+            z = h
         return self.head(z)
+
+    def local_forward(self, x):
+        """Returns logits + traces for manual local learning."""
+        x_flat = x.view(x.size(0), -1)
+        z = self.proj_in(x_flat)
+        traces = []  # (z_trace, h_trace, cell) per layer
+        for cell in self.cells:
+            h = torch.zeros_like(z)
+            h_trace = torch.zeros_like(z)
+            for _ in range(self.n_steps):
+                h = cell(h, z)
+                h_trace = self.decay * h_trace + h
+            sum_decay = (1 - self.decay**self.n_steps) / (1 - self.decay)
+            z_trace = z * sum_decay
+            traces.append((z_trace, h_trace, cell))
+            z = h
+        logits = self.head(z)
+        return logits, traces, x_flat, z
 
 
 class Deep_OSTTP_Model(nn.Module):
-    def __init__(self, num_layers, in_dim, hidden_dim, out_dim, n_steps=8):
+    """
+    Online local learning with Random Target Projection.
+    Use local_forward() + manual_train_step() instead of loss.backward().
+    """
+    def __init__(self, num_layers, in_dim, hidden_dim, out_dim, n_steps=8, decay=0.9):
         super().__init__()
         self.proj_in = nn.Linear(in_dim, hidden_dim)
         self.cells = nn.ModuleList([RecurrentCell(hidden_dim) for _ in range(num_layers)])
@@ -199,13 +139,35 @@ class Deep_OSTTP_Model(nn.Module):
         ])
         self.head = nn.Linear(hidden_dim, out_dim)
         self.n_steps = n_steps
+        self.decay = decay
 
     def forward(self, x):
         x = x.view(x.size(0), -1)
         z = self.proj_in(x)
         for i, cell in enumerate(self.cells):
-            z = OSTTP_Function.apply(z, cell, self.random_projections[i], self.n_steps, 0.9)
+            h = torch.zeros_like(z)
+            for _ in range(self.n_steps):
+                h = cell(h, z)
+            z = h
         return self.head(z)
+
+    def local_forward(self, x):
+        """Returns logits + traces for manual local learning."""
+        x_flat = x.view(x.size(0), -1)
+        z = self.proj_in(x_flat)
+        traces = []
+        for i, cell in enumerate(self.cells):
+            h = torch.zeros_like(z)
+            h_trace = torch.zeros_like(z)
+            for _ in range(self.n_steps):
+                h = cell(h, z)
+                h_trace = self.decay * h_trace + h
+            sum_decay = (1 - self.decay**self.n_steps) / (1 - self.decay)
+            z_trace = z * sum_decay
+            traces.append((z_trace, h_trace, cell, self.random_projections[i]))
+            z = h
+        logits = self.head(z)
+        return logits, traces, x_flat, z
 
 
 # =============================================================================
@@ -223,8 +185,122 @@ def get_cifar10_dataloader(batch_size=128):
     trainloader = torch.utils.data.DataLoader(
         trainset, batch_size=batch_size, shuffle=True, num_workers=2
     )
-    # CIFAR-10: 32x32x3 = 3072 input features, 10 classes
     return trainloader, 3072, 10
+
+
+# =============================================================================
+# TRAINING HELPERS
+# =============================================================================
+
+def manual_train_step_ostl(model, x, y, optimizer):
+    """Train OSTL without autograd on the recurrence."""
+    logits, traces, x_input, z_final = model.local_forward(x)
+    loss = F.cross_entropy(logits, y)
+
+    optimizer.zero_grad()
+    with torch.no_grad():
+        batch_size = y.size(0)
+        # dL/dlogits for cross-entropy + softmax
+        grad_logits = F.softmax(logits, dim=1)
+        grad_logits[range(batch_size), y] -= 1
+        grad_logits /= batch_size
+
+        # Head gradients
+        model.head.weight.grad = grad_logits.t() @ z_final
+        if model.head.bias is not None:
+            model.head.bias.grad = grad_logits.sum(0)
+
+        # Error signal for last layer (bypassed unchanged through depth)
+        error = grad_logits @ model.head.weight
+
+        # Backward through layers (local updates only)
+        for z_trace, h_trace, cell in reversed(traces):
+            cell.Wx.weight.grad = error.t() @ z_trace
+            cell.Wz.weight.grad = error.t() @ h_trace
+            if cell.Wz.bias is not None:
+                cell.Wz.bias.grad = error.sum(0)
+            # Bypass: error unchanged for previous layer
+
+        # proj_in gradients
+        model.proj_in.weight.grad = error.t() @ x_input
+        if model.proj_in.bias is not None:
+            model.proj_in.bias.grad = error.sum(0)
+
+    # Gradient clipping (manual)
+    total_norm = 0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            total_norm += p.grad.data.norm(2).item() ** 2
+    total_norm = total_norm ** 0.5
+    clip_coef = 1.0 / (total_norm + 1e-6)
+    if clip_coef < 1.0:
+        for p in model.parameters():
+            if p.grad is not None:
+                p.grad.data.mul_(clip_coef)
+
+    optimizer.step()
+    return loss.item()
+
+
+def manual_train_step_osttp(model, x, y, optimizer):
+    """Train OSTTP without autograd on the recurrence."""
+    logits, traces, x_input, z_final = model.local_forward(x)
+    loss = F.cross_entropy(logits, y)
+
+    optimizer.zero_grad()
+    with torch.no_grad():
+        batch_size = y.size(0)
+        grad_logits = F.softmax(logits, dim=1)
+        grad_logits[range(batch_size), y] -= 1
+        grad_logits /= batch_size
+
+        # Head gradients
+        model.head.weight.grad = grad_logits.t() @ z_final
+        if model.head.bias is not None:
+            model.head.bias.grad = grad_logits.sum(0)
+
+        # Error signal
+        error = grad_logits @ model.head.weight
+
+        # Backward through layers (random target projection)
+        for z_trace, h_trace, cell, rand_proj in reversed(traces):
+            projected_error = error @ rand_proj  # Local projected error
+            cell.Wx.weight.grad = projected_error.t() @ z_trace
+            cell.Wz.weight.grad = projected_error.t() @ h_trace
+            if cell.Wz.bias is not None:
+                cell.Wz.bias.grad = projected_error.sum(0)
+            # Bypass: original error passed to previous layer
+
+        # proj_in gradients
+        model.proj_in.weight.grad = error.t() @ x_input
+        if model.proj_in.bias is not None:
+            model.proj_in.bias.grad = error.sum(0)
+
+    # Gradient clipping
+    total_norm = 0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            total_norm += p.grad.data.norm(2).item() ** 2
+    total_norm = total_norm ** 0.5
+    clip_coef = 1.0 / (total_norm + 1e-6)
+    if clip_coef < 1.0:
+        for p in model.parameters():
+            if p.grad is not None:
+                p.grad.data.mul_(clip_coef)
+
+    optimizer.step()
+    return loss.item()
+
+
+def standard_train_step(model, x, y, optimizer):
+    """Standard backprop for BPTT and DEQ."""
+    optimizer.zero_grad()
+    logits = model(x)
+    loss = F.cross_entropy(logits, y)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    optimizer.step()
+    return loss.item()
 
 
 # =============================================================================
@@ -233,77 +309,91 @@ def get_cifar10_dataloader(batch_size=128):
 
 def run_benchmark(layer_counts=[1, 3, 5, 8, 10, 12], epochs=5):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\n--- CIFAR-10 Layer Scaling Benchmark ({device}) ---")
-    
+    print(f"\n=== CIFAR-10 Layer Scaling Benchmark ({device}) ===")
+    print("FIXED: DEQ = 1 equilibrium (weight-tied). OSTL/OSTTP = online updates (no autograd.Function).\n")
+
     loader, in_dim, out_dim = get_cifar10_dataloader(batch_size=128)
     hidden_dim = 256
-    
+
     results = {name: {} for name in ["Deep_BPTT", "Deep_Hybrid_DEQ", "Deep_OSTL", "Deep_OSTTP"]}
-    
+
     for layers in layer_counts:
-        print(f"\n=== Layers: {layers} ===")
-        
+        print(f"--- Layers: {layers} ---")
+
         configs = {
             "Deep_BPTT": Deep_BPTT_Model(layers, in_dim, hidden_dim, out_dim, n_steps=8),
             "Deep_Hybrid_DEQ": Deep_DEQ_Model(layers, in_dim, hidden_dim, out_dim),
             "Deep_OSTL": Deep_OSTL_Model(layers, in_dim, hidden_dim, out_dim, n_steps=8),
             "Deep_OSTTP": Deep_OSTTP_Model(layers, in_dim, hidden_dim, out_dim, n_steps=8),
         }
-        
+
         for name, model in configs.items():
             print(f"  {name}...", end=" ", flush=True)
             model.to(device)
             optimizer = optim.Adam(model.parameters(), lr=1e-3)
-            
+
             start = time.time()
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats()
-            
+
+            final_acc = 0.0
             for ep in range(epochs):
                 correct = total = 0
                 for x, y in loader:
                     x, y = x.to(device), y.to(device)
-                    optimizer.zero_grad()
-                    logits = model(x)
-                    loss = F.cross_entropy(logits, y)
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
-                    
-                    correct += (logits.argmax(dim=1) == y).sum().item()
+
+                    if name in ("Deep_OSTL", "Deep_OSTTP"):
+                        if name == "Deep_OSTL":
+                            manual_train_step_ostl(model, x, y, optimizer)
+                        else:
+                            manual_train_step_osttp(model, x, y, optimizer)
+                        # Compute accuracy
+                        with torch.no_grad():
+                            logits = model(x)
+                    else:
+                        standard_train_step(model, x, y, optimizer)
+                        with torch.no_grad():
+                            logits = model(x)
+
+                    preds = logits.argmax(dim=1)
+                    correct += (preds == y).sum().item()
                     total += y.size(0)
+
                 acc = correct / total * 100
-                if ep == epochs - 1:
-                    final_acc = acc
-            
+                final_acc = acc
+
             peak_vram = torch.cuda.max_memory_allocated() / (1024**2) if torch.cuda.is_available() else 0
             elapsed = time.time() - start
-            
+
             results[name][layers] = {"time": elapsed, "vram": peak_vram, "accuracy": final_acc}
             print(f"Time={elapsed:.1f}s VRAM={peak_vram:.0f}MB Acc={final_acc:.1f}%")
-            
+
     return results, layer_counts
 
 
 def plot(results, layers):
     os.makedirs("benchmark_plots", exist_ok=True)
-    
+
     for metric, ylabel, fname in [
-        ("vram", "VRAM (MB)", "layer_scaling_vram_cifar10.png"),
-        ("time", "Time (seconds)", "layer_scaling_time_cifar10.png"),
-        ("accuracy", "Accuracy (%)", "layer_scaling_accuracy_cifar10.png")
+        ("vram", "VRAM (MB)", "layer_scaling_vram_cifar10_fixed.png"),
+        ("time", "Time (seconds)", "layer_scaling_time_cifar10_fixed.png"),
+        ("accuracy", "Accuracy (%)", "layer_scaling_accuracy_cifar10_fixed.png")
     ]:
         plt.figure(figsize=(8, 5))
-        colors = {"Deep_BPTT": "blue", "Deep_Hybrid_DEQ": "green", 
-                  "Deep_OSTL": "red", "Deep_OSTTP": "purple"}
-        markers = {"Deep_BPTT": "o", "Deep_Hybrid_DEQ": "s", 
-                   "Deep_OSTL": "^", "Deep_OSTTP": "d"}
-        
+        colors = {
+            "Deep_BPTT": "blue", "Deep_Hybrid_DEQ": "green",
+            "Deep_OSTL": "red", "Deep_OSTTP": "purple"
+        }
+        markers = {
+            "Deep_BPTT": "o", "Deep_Hybrid_DEQ": "s",
+            "Deep_OSTL": "^", "Deep_OSTTP": "d"
+        }
+
         for name in colors:
             vals = [results[name][l][metric] for l in layers]
-            plt.plot(layers, vals, label=name.replace("_", " "), 
+            plt.plot(layers, vals, label=name.replace("_", " "),
                      marker=markers[name], color=colors[name], linewidth=2, markersize=7)
-        
+
         plt.title(f"{ylabel.split(' ')[0]} vs Number of Physical Layers (CIFAR-10)")
         plt.xlabel("Number of Layers")
         plt.ylabel(ylabel)
@@ -312,11 +402,11 @@ def plot(results, layers):
         plt.tight_layout()
         plt.savefig(f"benchmark_plots/{fname}")
         plt.close()
-    
+
     print("\nPlots saved to benchmark_plots/")
-    print("- layer_scaling_vram_cifar10.png")
-    print("- layer_scaling_time_cifar10.png")
-    print("- layer_scaling_accuracy_cifar10.png")
+    print("- layer_scaling_vram_cifar10_fixed.png")
+    print("- layer_scaling_time_cifar10_fixed.png")
+    print("- layer_scaling_accuracy_cifar10_fixed.png")
 
 
 if __name__ == "__main__":
