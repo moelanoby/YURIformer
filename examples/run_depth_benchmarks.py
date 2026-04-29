@@ -14,9 +14,11 @@ import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
 
 # =============================================================================
-# PATH SETUP — adjust to your YURIformer repo
+# PATH SETUP
 # =============================================================================
-# sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "learning_rules"))
+# Add the repo root so 'learning_rules' is importable as a package
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from learning_rules.DEQ_kernels import (
     DEQModule, HybridConfig, SolverFactory
 )
@@ -191,105 +193,7 @@ def get_cifar10_dataloader(batch_size=128):
 # =============================================================================
 # TRAINING HELPERS
 # =============================================================================
-
-def manual_train_step_ostl(model, x, y, optimizer):
-    """Train OSTL without autograd on the recurrence."""
-    logits, traces, x_input, z_final = model.local_forward(x)
-    loss = F.cross_entropy(logits, y)
-
-    optimizer.zero_grad()
-    with torch.no_grad():
-        batch_size = y.size(0)
-        # dL/dlogits for cross-entropy + softmax
-        grad_logits = F.softmax(logits, dim=1)
-        grad_logits[range(batch_size), y] -= 1
-        grad_logits /= batch_size
-
-        # Head gradients
-        model.head.weight.grad = grad_logits.t() @ z_final
-        if model.head.bias is not None:
-            model.head.bias.grad = grad_logits.sum(0)
-
-        # Error signal for last layer (bypassed unchanged through depth)
-        error = grad_logits @ model.head.weight
-
-        # Backward through layers (local updates only)
-        for z_trace, h_trace, cell in reversed(traces):
-            cell.Wx.weight.grad = error.t() @ z_trace
-            cell.Wz.weight.grad = error.t() @ h_trace
-            if cell.Wz.bias is not None:
-                cell.Wz.bias.grad = error.sum(0)
-            # Bypass: error unchanged for previous layer
-
-        # proj_in gradients
-        model.proj_in.weight.grad = error.t() @ x_input
-        if model.proj_in.bias is not None:
-            model.proj_in.bias.grad = error.sum(0)
-
-    # Gradient clipping (manual)
-    total_norm = 0.0
-    for p in model.parameters():
-        if p.grad is not None:
-            total_norm += p.grad.data.norm(2).item() ** 2
-    total_norm = total_norm ** 0.5
-    clip_coef = 1.0 / (total_norm + 1e-6)
-    if clip_coef < 1.0:
-        for p in model.parameters():
-            if p.grad is not None:
-                p.grad.data.mul_(clip_coef)
-
-    optimizer.step()
-    return loss.item()
-
-
-def manual_train_step_osttp(model, x, y, optimizer):
-    """Train OSTTP without autograd on the recurrence."""
-    logits, traces, x_input, z_final = model.local_forward(x)
-    loss = F.cross_entropy(logits, y)
-
-    optimizer.zero_grad()
-    with torch.no_grad():
-        batch_size = y.size(0)
-        grad_logits = F.softmax(logits, dim=1)
-        grad_logits[range(batch_size), y] -= 1
-        grad_logits /= batch_size
-
-        # Head gradients
-        model.head.weight.grad = grad_logits.t() @ z_final
-        if model.head.bias is not None:
-            model.head.bias.grad = grad_logits.sum(0)
-
-        # Error signal
-        error = grad_logits @ model.head.weight
-
-        # Backward through layers (random target projection)
-        for z_trace, h_trace, cell, rand_proj in reversed(traces):
-            projected_error = error @ rand_proj  # Local projected error
-            cell.Wx.weight.grad = projected_error.t() @ z_trace
-            cell.Wz.weight.grad = projected_error.t() @ h_trace
-            if cell.Wz.bias is not None:
-                cell.Wz.bias.grad = projected_error.sum(0)
-            # Bypass: original error passed to previous layer
-
-        # proj_in gradients
-        model.proj_in.weight.grad = error.t() @ x_input
-        if model.proj_in.bias is not None:
-            model.proj_in.bias.grad = error.sum(0)
-
-    # Gradient clipping
-    total_norm = 0.0
-    for p in model.parameters():
-        if p.grad is not None:
-            total_norm += p.grad.data.norm(2).item() ** 2
-    total_norm = total_norm ** 0.5
-    clip_coef = 1.0 / (total_norm + 1e-6)
-    if clip_coef < 1.0:
-        for p in model.parameters():
-            if p.grad is not None:
-                p.grad.data.mul_(clip_coef)
-
-    optimizer.step()
-    return loss.item()
+from learning_rules.neuromorphic_kernels import manual_train_step_ostl, manual_train_step_osttp
 
 
 def standard_train_step(model, x, y, optimizer):
@@ -301,6 +205,7 @@ def standard_train_step(model, x, y, optimizer):
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
     return loss.item()
+
 
 
 # =============================================================================
