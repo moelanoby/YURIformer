@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 # PATH SETUP — adjust to your YURIformer repo
 # =============================================================================
 # sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "learning_rules"))
-from DEQ_kernels import (
+from learning_rules.DEQ_kernels import (
     DEQModule, HybridConfig, SolverFactory
 )
 
